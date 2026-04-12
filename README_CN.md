@@ -15,7 +15,28 @@
 [![Feishu](https://img.shields.io/badge/Feishu-Group-E9DBFC?style=flat&logo=larksuite&logoColor=white)](./COMMUNICATION.md)
 [![WeChat](https://img.shields.io/badge/WeChat-Group-C5EAB4?style=flat&logo=wechat&logoColor=white)](./COMMUNICATION.md)
 
+**一条命令，进化你所有的 AI Agent**：OpenClaw、nanobot、Claude Code、Codex、Cursor 等
+
+<img src="assets/cli-typing.gif" width="500px" alt="openspace --query your task">
+
 </div>
+
+---
+
+## 📢 最新动态
+
+- **2026-04-09** 💬 多渠道**通信网关**上线。OpenSpace 现可接收并回复外部平台消息。内置 **WhatsApp**（Baileys bridge + 扫码认证）与**飞书**（HTTP webhook）适配器，支持会话管理、附件缓存和白名单访问控制。配置方式见 [`openspace/config/README.md`](openspace/config/README.md)。
+- **2026-04-07** 🌐 OpenSpace MCP 新增独立 **SSE** 与 **streamable HTTP** 启动方式，便于远端 host 通过 HTTP 接入，绕过基于 stdio 的 MCP server timeout 瓶颈。具体接入方式见 [host integration 文档](openspace/host_skills/README.md)。
+- **2026-04-06** 🛠️ 修复多项运行时问题，覆盖 grounding、MCP 服务、skill 进化与持久化链路，长流程执行的稳定性与恢复能力进一步提升。
+- **2026-04-05** 🧭 LLM 凭证解析清理完成：统一 `.env` 加载逻辑，改进宿主配置自动识别，并让 provider 原生环境变量处理更一致。
+- **2026-04-03** 🚀 发布 **v0.1.0** — Skill 质量监控上线：从优质 Skill 中提取结构模式，每日自动评估所有新提交；云端搜索全面升级，匹配更准、响应更快；社区自发形成生产级垂直 Skill 集群。前端新增中文（zh）国际化支持。
+- **2026-04-02** ⚡ 云端搜索升级，提升匹配质量、降低响应延迟。
+- **2026-03-31** 🛡️ 安全加固：zip 解压与 `import_skill` 新增路径穿越防护；CLI 启动时读取 `OPENSPACE_MODEL` 及 `OPENSPACE_LLM_*` 环境变量；修复 MiniMax 兼容性问题与 workflow ID 冲突。
+- **2026-03-29** 🔒 锁定 litellm 版本至 <1.82.7，规避 PYSEC-2026-2 供应链投毒。
+- **2026-03-28** 🔧 Skill 注册幂等化——`register_skill_dir` 对已注册目录直接返回已有 `SkillMeta`，不再重复创建。同步更新 OpenClaw 部署文档。
+- **2026-03-27** 🪟 修复 Windows 下 stdio 死锁；evolver 确认解析改用词干匹配，消除误判。
+- **2026-03-26** 🌱 Skill 目录支持每次调用时动态重扫描，本地搜索更轻量，文档同步精简。
+- **2026-03-25** 🎉 OpenSpace 正式开源！
 
 ---
 
@@ -140,6 +161,15 @@ pip install -e .
 openspace-mcp --help   # 验证安装
 ```
 
+> [!TIP]
+> **Clone 太慢？** `assets/` 目录包含约 50 MB 的图片文件，导致仓库较大。使用以下轻量方式跳过它：
+> ```bash
+> git clone --filter=blob:none --sparse https://github.com/HKUDS/OpenSpace.git
+> cd OpenSpace
+> git sparse-checkout set '/*' '!assets/'
+> pip install -e .
+> ```
+
 **选择你的路径：**
 - **[路径 A](#-路径-a为你的-agent-接入)** — 将 OpenSpace 接入你的 Agent
 - **[路径 B](#-路径-b作为你的-ai-协作者)** — 直接使用 OpenSpace 作为你的 AI 协作者
@@ -168,6 +198,18 @@ openspace-mcp --help   # 验证安装
 
 > [!TIP]
 > 凭证（API 密钥、模型）会从你的 Agent 配置中**自动检测**，通常无需手动设置。
+
+> [!NOTE]
+> OpenSpace 支持 3 种启动方式：
+> - **stdio**：在宿主配置里保留 `command: "openspace-mcp"`。
+> - **SSE**：先启动 `openspace-mcp --transport sse --host 127.0.0.1 --port 8080`。
+> - **streamable HTTP**：先启动 `openspace-mcp --transport streamable-http --host 127.0.0.1 --port 8081`。
+>
+> 通用远端 endpoint：
+> - SSE: `http://127.0.0.1:8080/sse`
+> - streamable HTTP: `http://127.0.0.1:8081/mcp`
+>
+> `stdio` 最简单。HTTP 模式会把 OpenSpace 作为独立服务常驻，但 **不同宿主的注册写法不同**，而且 **调用方自己的 timeout 仍然生效**。
 
 **② 将 Skill 复制**到你的 Agent Skill 目录：
 
@@ -479,6 +521,14 @@ OpenSpace/
 │   │   ├── embedding.py                  # Skill 搜索的向量生成
 │   │   ├── auth.py                       # API 密钥管理
 │   │   └── cli/                          # CLI 工具（download_skill、upload_skill）
+│   │
+│   ├── 💬 communication/                  # 多渠道通信网关
+│   │   ├── gateway.py                    # 消息路由、会话管理、回复分发
+│   │   ├── adapters/                     # 平台适配器（WhatsApp、飞书）
+│   │   ├── bridges/                      # 非 Python 运行时（WhatsApp Baileys bridge）
+│   │   ├── config.py                     # 通信配置加载
+│   │   ├── session_store.py              # 按频道的会话持久化
+│   │   └── types.py                      # ChannelMessage, ChannelSource, SendResult
 │   │
 │   ├── 🔧 platform/                      # 平台抽象（系统信息、截图）
 │   ├── 🔧 host_detection/                # 自动检测 nanobot / openclaw 凭证

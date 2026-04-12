@@ -2,21 +2,16 @@ import litellm
 import json
 import asyncio
 import time
-from pathlib import Path
 from typing import List, Sequence, Union, Dict, Optional
-from dotenv import load_dotenv
 from openai.types.chat import ChatCompletionToolParam
 
 from openspace.grounding.core.types import ToolSchema, ToolResult, ToolStatus
 from openspace.grounding.core.tool import BaseTool
 from openspace.utils.logging import Logger
 
-# Load .env from openspace package root (works regardless of CWD),
-# then fall back to CWD/.env.  override=False (default) means first-loaded wins.
-_PKG_ENV = Path(__file__).resolve().parent.parent / ".env"  # openspace/.env
-if _PKG_ENV.is_file():
-    load_dotenv(_PKG_ENV)
-load_dotenv()  # also try CWD/.env for any remaining vars
+# .env loading is centralized in host_detection.resolver.load_runtime_env().
+# CLI/MCP entrypoints call it before reading startup env vars, and the
+# resolver helpers also call it defensively.
 
 # Disable LiteLLM verbose logging to prevent stdout blocking with large tool schemas
 litellm.set_verbose = False
@@ -175,9 +170,10 @@ def _infer_backend_from_tool_name(tool_name: str) -> Optional[str]:
     if not tool_name or not isinstance(tool_name, str):
         return None
     name = tool_name.strip()
-    # Dedup format: "server__toolname" -> use suffix
+    # Dedup format: "server__toolname" -> use suffix.
+    # Use rsplit to handle server names that themselves contain "__".
     if "__" in name:
-        name = name.split("__", 1)[-1]
+        name = name.rsplit("__", 1)[-1]
     shell_tools = {"shell_agent", "read_file", "write_file", "list_dir", "run_shell"}
     if name in shell_tools:
         return "shell"
@@ -190,6 +186,37 @@ def _infer_backend_from_tool_name(tool_name: str) -> Optional[str]:
     return None
 
 
+def _resolve_tool_call_target(
+    tool_name: str,
+    tool_map: Dict[str, BaseTool],
+) -> tuple[Optional[BaseTool], List[str]]:
+    """Resolve a returned tool name to a concrete tool object.
+
+    The LLM is expected to return the deduped tool key from ``tool_map``.
+    Some providers occasionally return the short schema name instead. In that
+    case we only recover when exactly one tool shares that schema name; if
+    multiple tools match, the call is ambiguous and should not be executed.
+    """
+    tool_obj = tool_map.get(tool_name)
+    if tool_obj is not None or not tool_name:
+        return tool_obj, []
+
+    fallback_matches = [
+        (llm_name, tool)
+        for llm_name, tool in tool_map.items()
+        if getattr(getattr(tool, "schema", None), "name", None) == tool_name
+    ]
+    if len(fallback_matches) == 1:
+        resolved_name, resolved_tool = fallback_matches[0]
+        logger.info(
+            f"[TOOL_FALLBACK] Resolved short tool name '{tool_name}' to '{resolved_name}'"
+        )
+        return resolved_tool, []
+    if len(fallback_matches) > 1:
+        return None, [llm_name for llm_name, _tool in fallback_matches]
+    return None, []
+
+
 DEFAULT_SUMMARIZE_THRESHOLD_CHARS = 200000  # ~50K tokens, lowered from 400K to prevent context overflow
 MAX_TOOL_RESULT_CHARS = 200000  # Fallback truncation limit when summarization fails (~50K tokens)
 
@@ -198,7 +225,8 @@ async def _summarize_tool_result(
     tool_name: str,
     task: str = "",
     model: str = "openrouter/anthropic/claude-sonnet-4.5",
-    timeout: float = 120.0
+    timeout: float = 120.0,
+    litellm_kwargs: Optional[Dict] = None,
 ) -> str:
     """Use LLM to summarize large tool results."""
     try:
@@ -234,11 +262,13 @@ Content:
 
 Concise summary:"""
         
+        _extra = litellm_kwargs or {}
         response = await asyncio.wait_for(
             litellm.acompletion(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                timeout=timeout
+                timeout=timeout,
+                **_extra,
             ),
             timeout=timeout + 5
         )
@@ -265,7 +295,8 @@ async def _tool_result_to_message_async(
     task: str = "",
     summarize_threshold: int = DEFAULT_SUMMARIZE_THRESHOLD_CHARS,
     summarize_model: str = "openrouter/anthropic/claude-sonnet-4.5",
-    enable_summarization: bool = True
+    enable_summarization: bool = True,
+    litellm_kwargs: Optional[Dict] = None,
 ) -> Dict:
     """Convert ToolResult to LLMClient usable message format with LLM summarization for large results.
 
@@ -294,7 +325,7 @@ async def _tool_result_to_message_async(
     
     # Use LLM summarization if content exceeds threshold
     if original_len > summarize_threshold and enable_summarization:
-        summary = await _summarize_tool_result(text_content, tool_name, task, summarize_model)
+        summary = await _summarize_tool_result(text_content, tool_name, task, summarize_model, litellm_kwargs=litellm_kwargs)
         if summary:
             text_content = summary
         elif original_len > MAX_TOOL_RESULT_CHARS:
@@ -406,6 +437,95 @@ class LLMClient:
         self._logger = Logger.get_logger(__name__)
         self._last_call_time = 0.0
     
+    @staticmethod
+    def _merge_consecutive_system_messages(messages: List[Dict]) -> List[Dict]:
+        """Merge consecutive system messages into one.
+
+        Providers like MiniMax reject requests that contain multiple consecutive
+        messages with the same role (error 2013 "invalid chat setting").
+        Merging is safe for all providers — it simply concatenates the content.
+        """
+        if not messages:
+            return messages
+        merged: List[Dict] = []
+        for msg in messages:
+            if (
+                merged
+                and msg.get("role") == "system"
+                and merged[-1].get("role") == "system"
+            ):
+                merged[-1] = {
+                    "role": "system",
+                    "content": merged[-1].get("content", "") + "\n\n" + msg.get("content", ""),
+                }
+            else:
+                merged.append(msg.copy())
+        return merged
+
+    @staticmethod
+    def _is_minimax_model(model: str) -> bool:
+        return isinstance(model, str) and "minimax" in model.lower()
+
+    @classmethod
+    def _rewrite_nonleading_system_messages_for_minimax(
+        cls,
+        messages: List[Dict],
+    ) -> List[Dict]:
+        """Rewrite non-leading system messages into internal user notes for MiniMax."""
+        rewritten: List[Dict] = []
+        rewritten_count = 0
+
+        for msg in messages:
+            msg_copy = msg.copy()
+            if msg_copy.get("role") == "system" and rewritten:
+                content = msg_copy.get("content", "")
+                if isinstance(content, str):
+                    msg_copy["content"] = (
+                        "[INTERNAL ORCHESTRATION NOTE]\n"
+                        "This note was originally injected as a system message by the "
+                        "agent runtime. Treat it as workflow guidance, not as a new "
+                        "end-user request.\n\n"
+                        f"{content}"
+                    )
+                msg_copy["role"] = "user"
+                rewritten_count += 1
+            rewritten.append(msg_copy)
+
+        if rewritten_count:
+            logger.info(
+                "Rewrote %d non-leading system message(s) for MiniMax compatibility",
+                rewritten_count,
+            )
+
+        return rewritten
+
+    @classmethod
+    def _normalize_messages_for_model(cls, messages: List[Dict], model: str) -> List[Dict]:
+        """Normalize message history only when a provider requires it."""
+        if not cls._is_minimax_model(model):
+            return messages
+
+        minimized_system_history = cls._merge_consecutive_system_messages(messages)
+        return cls._rewrite_nonleading_system_messages_for_minimax(
+            minimized_system_history
+        )
+
+    @staticmethod
+    def _serialize_response_field(value):
+        """Convert provider response fields into plain Python containers."""
+        if hasattr(value, "model_dump"):
+            return value.model_dump(exclude_none=True)
+        if isinstance(value, list):
+            return [LLMClient._serialize_response_field(item) for item in value]
+        if isinstance(value, tuple):
+            return [LLMClient._serialize_response_field(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: LLMClient._serialize_response_field(item)
+                for key, item in value.items()
+            }
+        return value
+
     async def _rate_limit(self):
         """Apply rate limiting by adding delay between API calls"""
         if self.rate_limit_delay > 0:
@@ -539,6 +659,7 @@ class LLMClient:
             "model": kwargs.get("model", self.model),
             **self.litellm_kwargs,
         }
+        request_model = completion_kwargs["model"]
         
         # Add thinking/reasoning_effort only if explicitly enabled and not using tools
         enable_thinking = kwargs.get("enable_thinking", self.enable_thinking)
@@ -561,10 +682,16 @@ class LLMClient:
         if enable_thinking:
             completion_kwargs["reasoning_effort"] = kwargs.get("reasoning_effort", "medium")
         
-        # 4. Apply rate limiting
+        # 4. Normalize messages for providers with stricter role constraints.
+        current_messages = self._normalize_messages_for_model(
+            current_messages,
+            request_model,
+        )
+
+        # 5. Apply rate limiting
         await self._rate_limit()
         
-        # 5. Call LLM with retry (single round)
+        # 6. Call LLM with retry (single round)
         completion_kwargs["messages"] = current_messages
         response = await self._call_with_retry(**completion_kwargs)
         
@@ -578,6 +705,11 @@ class LLMClient:
             "role": "assistant",
             "content": response_message.content or "",
         }
+
+        for field_name in ("reasoning_details", "reasoning_content", "name"):
+            field_value = getattr(response_message, field_name, None)
+            if field_value:
+                assistant_message[field_name] = self._serialize_response_field(field_value)
         
         tool_calls = getattr(response_message, 'tool_calls', None)
         if tool_calls:
@@ -604,14 +736,9 @@ class LLMClient:
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 
-                # Resolve tool instance: key might differ from model response (e.g. API returns
-                # "read_file" while we stored "server__read_file" for dedup), so fallback by schema.name
-                tool_obj = tool_map.get(tool_name)
-                if tool_obj is None and tool_name:
-                    for _k, _t in tool_map.items():
-                        if getattr(getattr(_t, "schema", None), "name", None) == tool_name:
-                            tool_obj = _t
-                            break
+                # Resolve tool instance: some providers return the short schema
+                # name instead of the deduped LLM-visible tool key.
+                tool_obj, ambiguous_tool_names = _resolve_tool_call_target(tool_name, tool_map)
                 
                 backend = None
                 server_name = None
@@ -653,15 +780,24 @@ class LLMClient:
                 except (json.JSONDecodeError, ValueError, TypeError) as e:
                     self._logger.debug(f"Failed to parse tool arguments for {tool_name}: {e}")
                 
-                if tool_name not in tool_map:
-                    result = ToolResult(
-                        status=ToolStatus.ERROR,
-                        error=f"Tool '{tool_name}' not found"
-                    )
+                if tool_obj is None:
+                    if ambiguous_tool_names:
+                        result = ToolResult(
+                            status=ToolStatus.ERROR,
+                            error=(
+                                f"Tool '{tool_name}' is ambiguous; matches: "
+                                f"{', '.join(ambiguous_tool_names)}"
+                            )
+                        )
+                    else:
+                        result = ToolResult(
+                            status=ToolStatus.ERROR,
+                            error=f"Tool '{tool_name}' not found"
+                        )
                 else:
                     try:
                         result = await _execute_tool_call(
-                            tool=tool_map[tool_name],
+                            tool=tool_obj,
                             openai_tool_call={
                                 "id": tool_call.id,
                                 "type": "function",
@@ -697,7 +833,8 @@ class LLMClient:
                     task=user_task,
                     summarize_threshold=self.summarize_threshold_chars,
                     summarize_model=self.model,
-                    enable_summarization=self.enable_tool_result_summarization
+                    enable_summarization=self.enable_tool_result_summarization,
+                    litellm_kwargs=self.litellm_kwargs,
                 )
                 current_messages.append(tool_message)
                 
@@ -722,6 +859,10 @@ class LLMClient:
                 "content": summary_prompt
             }
             current_messages.append(summary_message)
+            current_messages = self._normalize_messages_for_model(
+                current_messages,
+                request_model,
+            )
             
             # Apply rate limiting before summary call
             await self._rate_limit()
@@ -729,7 +870,7 @@ class LLMClient:
             # Call LLM to generate summary (without tools)
             summary_kwargs = {
                 **self.litellm_kwargs,
-                "model": self.model,
+                "model": request_model,
                 "messages": current_messages,
                 "tools": [], 
                 "tool_choice": "none",

@@ -7,8 +7,9 @@ Exposes the following tools to MCP clients:
   upload_skill   — Upload a local skill to cloud (pre-saved metadata, bot decides visibility)
 
 Usage:
-    python -m openspace.mcp_server                     # stdio (default)
+    python -m openspace.mcp_server                     # auto (TTY -> SSE, MCP host -> stdio)
     python -m openspace.mcp_server --transport sse     # SSE on port 8080
+    python -m openspace.mcp_server --transport streamable-http  # Streamable HTTP on port 8080
     python -m openspace.mcp_server --port 9090         # SSE on custom port
 
 Environment variables: see ``openspace/host_detection/`` and ``openspace/cloud/auth.py``.
@@ -22,7 +23,6 @@ import json
 import logging
 import os
 import sys
-import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -75,11 +75,26 @@ class _MCPSafeStdout:
     def seekable(self):
         return False
 
-_real_stdout = sys.stdout
-sys.stdout = _MCPSafeStdout(_real_stdout, sys.stderr)
+    def __getattr__(self, name):
+        return getattr(self._stderr, name)
 
 _LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_real_stdout = sys.stdout
+
+# Windows pipe buffers are small. When using stdio MCP transport,
+# the parent process only reads stdout for MCP messages and does NOT
+# drain stderr. Heavy log/print output during execute_task fills the stderr
+# pipe buffer, blocking this process on write() → deadlock → timeout.
+# Redirect stderr to a log file on Windows to prevent this.
+if os.name == "nt":
+    _stderr_file = open(
+        _LOG_DIR / "mcp_stderr.log", "a", encoding="utf-8", buffering=1
+    )
+    sys.stderr = _stderr_file
+
+sys.stdout = _MCPSafeStdout(_real_stdout, sys.stderr)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,7 +138,13 @@ async def _get_openspace():
 
         logger.info("Initializing OpenSpace engine ...")
         from openspace.tool_layer import OpenSpace, OpenSpaceConfig
-        from openspace.host_detection import build_llm_kwargs, build_grounding_config_path
+        from openspace.host_detection import (
+            build_grounding_config_path,
+            build_llm_kwargs,
+            load_runtime_env,
+        )
+
+        load_runtime_env()
 
         env_model = os.environ.get("OPENSPACE_MODEL", "")
         workspace = os.environ.get("OPENSPACE_WORKSPACE")
@@ -181,6 +202,61 @@ def _get_store():
         from openspace.skill_engine import SkillStore
         _standalone_store = SkillStore()
     return _standalone_store
+
+
+def _get_local_skill_registry():
+    """Build a lightweight SkillRegistry for local-only skill search.
+
+    This avoids initializing the full OpenSpace engine when callers only
+    want to inspect local skills. It mirrors the skill directory discovery
+    order used by the full engine, but skips LLM / provider startup.
+    The registry is rebuilt per call so later local searches can see
+    newly added skills without requiring a process restart.
+    """
+    from openspace.config import get_config
+    from openspace.skill_engine import SkillRegistry
+
+    skill_paths: List[Path] = []
+
+    host_dirs_raw = os.environ.get("OPENSPACE_HOST_SKILL_DIRS", "")
+    if host_dirs_raw:
+        for d in host_dirs_raw.split(","):
+            d = d.strip()
+            if not d:
+                continue
+            p = Path(d)
+            if p.exists():
+                skill_paths.append(p)
+            else:
+                logger.warning("Host skill dir does not exist: %s", d)
+
+    try:
+        skill_cfg = get_config().skills
+    except Exception as e:
+        logger.warning("Failed to load local skill config: %s", e)
+        skill_cfg = None
+
+    if skill_cfg and skill_cfg.skill_dirs:
+        for d in skill_cfg.skill_dirs:
+            p = Path(d)
+            if p in skill_paths:
+                continue
+            if p.exists():
+                skill_paths.append(p)
+            else:
+                logger.warning("Configured skill dir does not exist: %s", d)
+
+    builtin_skills = Path(__file__).resolve().parent / "skills"
+    if builtin_skills.exists():
+        skill_paths.append(builtin_skills)
+
+    if not skill_paths:
+        logger.debug("No local skill directories found")
+        return None
+
+    registry = SkillRegistry(skill_dirs=skill_paths)
+    registry.discover()
+    return registry
 
 
 def _get_cloud_client():
@@ -259,16 +335,13 @@ def _read_upload_meta(skill_dir: Path) -> Dict[str, Any]:
 async def _auto_register_skill_dirs(skill_dirs: List[str]) -> int:
     """Register bot skill directories into OpenSpace's SkillRegistry + DB.
 
-    Called automatically by ``execute_task`` when ``skill_dirs`` is provided.
-    Already-registered directories are skipped (idempotent within a session).
+    Called automatically by ``execute_task`` on every invocation. Directories
+    are re-scanned each time so that skills created by the host bot since the last call are discovered immediately.
     """
     global _registered_skill_dirs
 
-    new_dirs = [
-        Path(d) for d in skill_dirs
-        if d not in _registered_skill_dirs and Path(d).is_dir()
-    ]
-    if not new_dirs:
+    valid_dirs = [Path(d) for d in skill_dirs if Path(d).is_dir()]
+    if not valid_dirs:
         return 0
 
     openspace = await _get_openspace()
@@ -277,19 +350,21 @@ async def _auto_register_skill_dirs(skill_dirs: List[str]) -> int:
         logger.warning("_auto_register_skill_dirs: SkillRegistry not initialized")
         return 0
 
-    added = registry.discover_from_dirs(new_dirs)
+    added = registry.discover_from_dirs(valid_dirs)
 
     db_created = 0
     if added:
         store = _get_store()
         db_created = await store.sync_from_registry(added)
 
+    is_first = any(d not in _registered_skill_dirs for d in skill_dirs)
     for d in skill_dirs:
         _registered_skill_dirs.add(d)
 
     if added:
+        action = "Auto-registered" if is_first else "Re-scanned & found"
         logger.info(
-            f"Auto-registered {len(added)} skill(s) from {len(new_dirs)} dir(s), "
+            f"{action} {len(added)} skill(s) from {len(valid_dirs)} dir(s), "
             f"{db_created} new DB record(s)"
         )
     return len(added)
@@ -299,63 +374,48 @@ async def _cloud_search_and_import(task: str, limit: int = 8) -> List[Dict[str, 
     """Search cloud for skills relevant to *task* and auto-import top hits.
 
     This is **stage 1** of a two-stage pipeline:
-      Stage 1 (here): cloud BM25+embedding → pick top-N to import locally.
+      Stage 1 (here): server-side embedding search → pick top-N to import locally.
       Stage 2 (tool_layer): local BM25 + LLM → select from ALL local skills
                             (including ones just imported) for injection.
 
     Stage 1 intentionally imports more than will be used (default: 8) so
-    that stage 2 has a larger pool to choose from.  The two BM25 passes
-    are NOT redundant — stage 1 filters thousands of cloud candidates down
+    that stage 2 has a larger pool to choose from. Stage 1 relies on the
+    server's embedding search to filter thousands of cloud candidates down
     to a manageable import set; stage 2 makes the final task-specific choice.
     """
     try:
-        from openspace.cloud.search import (
-            SkillSearchEngine, build_cloud_candidates,
-        )
-        from openspace.cloud.embedding import generate_embedding, resolve_embedding_api
-
-        client = _get_cloud_client()
-        embedding_api_key, _ = resolve_embedding_api()
-        has_embedding = bool(embedding_api_key)
-
-        items = await asyncio.to_thread(
-            client.fetch_metadata, include_embedding=has_embedding, limit=200,
-        )
-        if not items:
+        normalized_task_query = task.strip()
+        if not normalized_task_query:
             return []
 
-        candidates = build_cloud_candidates(items)
-        if not candidates:
+        cloud_client = _get_cloud_client()
+        cloud_search_results = await asyncio.to_thread(
+            cloud_client.search_record_embeddings,
+            query=normalized_task_query,
+            limit=min(limit * 2, 300),
+        )
+        if not cloud_search_results:
             return []
 
-        query_embedding: Optional[List[float]] = None
-        if has_embedding:
-            query_embedding = await asyncio.to_thread(
-                generate_embedding, task,
-            )
-
-        engine = SkillSearchEngine()
-        results = engine.search(task, candidates, query_embedding=query_embedding, limit=limit * 2)
-
-        cloud_hits = [
-            r for r in results
-            if r.get("source") == "cloud"
-            and r.get("visibility", "public") == "public"
-            and r.get("skill_id")
+        public_cloud_hits = [
+            cloud_result for cloud_result in cloud_search_results
+            if cloud_result.get("visibility", "public") == "public"
+            and cloud_result.get("record_id")
         ][:limit]
 
         import_results: List[Dict[str, Any]] = []
-        for hit in cloud_hits:
+        for cloud_hit in public_cloud_hits:
             try:
-                imp = await _do_import_cloud_skill(skill_id=hit["skill_id"])
+                skill_id = cloud_hit["record_id"]
+                imp = await _do_import_cloud_skill(skill_id=skill_id)
                 import_results.append({
-                    "skill_id": hit["skill_id"],
-                    "name": hit.get("name", ""),
+                    "skill_id": skill_id,
+                    "name": cloud_hit.get("name", ""),
                     "import_status": imp.get("status", "error"),
                     "local_path": imp.get("local_path", ""),
                 })
             except Exception as e:
-                logger.warning(f"Cloud import failed for {hit['skill_id']}: {e}")
+                logger.warning(f"Cloud import failed for {skill_id}: {e}")
 
         if import_results:
             logger.info(f"Cloud search imported {len(import_results)} skill(s)")
@@ -495,8 +555,9 @@ async def execute_task(
         workspace_dir: Working directory. Defaults to OPENSPACE_WORKSPACE env.
         max_iterations: Max agent iterations (default: 20).
         skill_dirs: Bot's skill directories to auto-register so OpenSpace
-                    can select and track them.  Already-registered dirs are
-                    silently skipped.
+                    can select and track them.  Directories are re-scanned
+                    on every call to discover skills created since the last
+                    invocation.
         search_scope: Skill search scope before execution.
                       "all" (default) — local + cloud; falls back to local
                       if no API key is configured.
@@ -505,9 +566,31 @@ async def execute_task(
     try:
         openspace = await _get_openspace()
 
-        # Auto-register bot skill directories
+        # Re-scan host skill directories (from env) to pick up skills
+        # created by the host bot since the last call.
+        host_skill_dirs_raw = os.environ.get("OPENSPACE_HOST_SKILL_DIRS", "")
+        if host_skill_dirs_raw:
+            env_dirs = [d.strip() for d in host_skill_dirs_raw.split(",") if d.strip()]
+            if env_dirs:
+                await _auto_register_skill_dirs(env_dirs)
+
+        # Auto-register bot skill directories (from call parameter)
         if skill_dirs:
             await _auto_register_skill_dirs(skill_dirs)
+
+        # Determine where CAPTURED skills should be written.
+        # Prefer the explicit skill_dirs parameter (= calling host agent's dir),
+        # then fall back to the first env-based host skill dir.
+        capture_skill_dir: str | None = None
+        if skill_dirs:
+            capture_skill_dir = skill_dirs[0]
+        elif host_skill_dirs_raw:
+            first_env = next(
+                (d.strip() for d in host_skill_dirs_raw.split(",") if d.strip()),
+                None,
+            )
+            if first_env:
+                capture_skill_dir = first_env
 
         # Cloud search + import (if requested)
         imported_skills: List[Dict[str, Any]] = []
@@ -519,6 +602,7 @@ async def execute_task(
             task=task,
             workspace_dir=workspace_dir,
             max_iterations=max_iterations,
+            capture_skill_dir=capture_skill_dir,
         )
 
         # Write .upload_meta.json for each evolved skill
@@ -534,7 +618,7 @@ async def execute_task(
 
     except Exception as e:
         logger.error(f"execute_task failed: {e}", exc_info=True)
-        return _json_error(e, status="error", traceback=traceback.format_exc(limit=5))
+        return _json_error(e, status="error")
 
 
 @mcp.tool()
@@ -571,11 +655,22 @@ async def search_skills(
         if not q:
             return _json_ok({"results": [], "count": 0})
 
-        # Resolve local skills + store
+        # Re-scan host skill directories so newly created skills are searchable.
         local_skills = None
         store = None
-        if source in ("all", "local"):
+        if source == "local":
+            registry = _get_local_skill_registry()
+            if registry:
+                local_skills = registry.list_skills()
+        elif source == "all":
             openspace = await _get_openspace()
+
+            host_skill_dirs_raw = os.environ.get("OPENSPACE_HOST_SKILL_DIRS", "")
+            if host_skill_dirs_raw:
+                env_dirs = [d.strip() for d in host_skill_dirs_raw.split(",") if d.strip()]
+                if env_dirs:
+                    await _auto_register_skill_dirs(env_dirs)
+
             registry = openspace._skill_registry
             if registry:
                 local_skills = registry.list_skills()
@@ -744,7 +839,7 @@ async def fix_skill(
 
     except Exception as e:
         logger.error(f"fix_skill failed: {e}", exc_info=True)
-        return _json_error(e, status="error", traceback=traceback.format_exc(limit=5))
+        return _json_error(e, status="error")
 
 
 @mcp.tool()
@@ -815,20 +910,83 @@ async def upload_skill(
 
     except Exception as e:
         logger.error(f"upload_skill failed: {e}", exc_info=True)
-        return _json_error(e, status="error", traceback=traceback.format_exc(limit=5))
+        return _json_error(e, status="error")
 
 def run_mcp_server() -> None:
     """Console-script entry point for ``openspace-mcp``."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="OpenSpace MCP Server")
-    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
-    parser.add_argument("--port", type=int, default=8080)
-    args = parser.parse_args()
+    def _port_flag_was_set(argv: list[str]) -> bool:
+        return any(arg == "--port" or arg.startswith("--port=") for arg in argv)
 
-    if args.transport == "sse":
-        mcp.run(transport="sse", sse_params={"port": args.port})
+    def _parse_port_from_env(default: int = 8080) -> int:
+        raw_port = os.environ.get("OPENSPACE_MCP_PORT", "").strip()
+        if not raw_port:
+            return default
+        try:
+            return int(raw_port)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid OPENSPACE_MCP_PORT=%r; falling back to %d.",
+                raw_port,
+                default,
+            )
+            return default
+
+    def _parse_host_from_env(default: str = "127.0.0.1") -> str:
+        return os.environ.get("OPENSPACE_MCP_HOST", "").strip() or default
+
+    def _resolve_transport(requested_transport: str, argv: list[str]) -> str:
+        if requested_transport in ("stdio", "sse", "streamable-http"):
+            return requested_transport
+
+        env_transport = os.environ.get("OPENSPACE_MCP_TRANSPORT", "").strip().lower()
+        if env_transport:
+            if env_transport in ("stdio", "sse", "streamable-http"):
+                return env_transport
+            logger.warning(
+                "Ignoring invalid OPENSPACE_MCP_TRANSPORT=%r; expected 'stdio', 'sse', or 'streamable-http'.",
+                env_transport,
+            )
+
+        # Treat an explicit port override as an HTTP/SSE intent. This keeps the
+        # CLI behavior aligned with the usage examples above.
+        if _port_flag_was_set(argv):
+            return "sse"
+
+        stdin_is_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+        stdout_is_tty = _real_stdout.isatty()
+        return "sse" if stdin_is_tty and stdout_is_tty else "stdio"
+
+    argv = sys.argv[1:]
+    parser = argparse.ArgumentParser(description="OpenSpace MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["auto", "stdio", "sse", "streamable-http"],
+        default="auto",
+    )
+    parser.add_argument("--host", default=_parse_host_from_env())
+    parser.add_argument("--port", type=int, default=_parse_port_from_env())
+    args = parser.parse_args(argv)
+
+    transport = _resolve_transport(args.transport, argv)
+
+    if transport == "sse":
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        logger.info("Starting OpenSpace MCP server with SSE transport on port %s", args.port)
+        mcp.run(transport="sse")
+    elif transport == "streamable-http":
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        logger.info(
+            "Starting OpenSpace MCP server with streamable HTTP transport on %s:%s",
+            args.host,
+            args.port,
+        )
+        mcp.run(transport="streamable-http")
     else:
+        logger.info("Starting OpenSpace MCP server with stdio transport")
         mcp.run(transport="stdio")
 
 
